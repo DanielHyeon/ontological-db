@@ -98,6 +98,20 @@ COPY --from=builder /src/engine/target/release/ontological-pg16/usr/share/postgr
 # 볼륨이 이미 있으면 안 돈다. 그래서 여기서 하는 일은 전부 멱등이어야 한다.
 COPY docker/runtime/10-ontological-init.sh /docker-entrypoint-initdb.d/10-ontological-init.sh
 
+# **CR 을 걷어내고, 걷혔는지 확인한다.** Windows 체크아웃은 `.sh` 를 CRLF 로 내려
+# 주고(`core.autocrlf`), 그러면 shebang 이 `bash\r` 이 되어 훅이 통째로 안 돈다 —
+# 2026-09-28 납품본이 실제로 그렇게 나갔다. `.gitattributes` 가 1차 방어지만 zip
+# 배포나 attributes 를 무시하는 클론이 있어 여기서 한 번 더 막는다.
+#
+# 확인까지 하는 이유: 이 결함은 **실패로 드러나지 않는다.** 훅이 안 돌아도
+# 엔트리포인트는 계속 가고 Postgres 는 healthy 로 뜬다. 남는 것은 확장도 graph 도
+# 없는 빈 DB 이고, 그 사실은 한참 뒤 앱 화면에서야 나타난다. 그래서 **빌드에서**
+# 멈춘다.
+RUN sed -i 's/\r$//' /docker-entrypoint-initdb.d/10-ontological-init.sh \
+ && head -1 /docker-entrypoint-initdb.d/10-ontological-init.sh | grep -q '^#!/usr/bin/env bash$' \
+ && ! grep -q "$(printf '\r')" /docker-entrypoint-initdb.d/10-ontological-init.sh \
+ && chmod 0755 /docker-entrypoint-initdb.d/10-ontological-init.sh
+
 # 공식 엔트리포인트를 그대로 쓴다 — initdb·PGDATA·시그널 처리를 다시 만들지 않는다.
 
 # =============================================================================

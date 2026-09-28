@@ -1,0 +1,30 @@
+# 셸 스크립트는 **반드시 LF** 로 체크아웃한다.
+#
+# ## 왜 필요한가 — 2026-09-28 에 납품본이 이것 때문에 깨졌다
+#
+# Windows 에서 `core.autocrlf=true` 로 클론하면 `.sh` 가 CRLF 로 내려온다. 저장소
+# 안(blob)은 LF 로 멀쩡한데 **작업 트리만** CRLF 다. 그리고 `Dockerfile.runtime` 의
+#
+#     COPY docker/runtime/10-ontological-init.sh /docker-entrypoint-initdb.d/
+#
+# 는 작업 트리를 굽는다. 그래서 Windows 에서 만든 이미지 안의 shebang 이
+# `#!/usr/bin/env bash\r` 가 되고, 컨테이너가 이렇게 답한다.
+#
+#     /usr/bin/env: 'bash\r': No such file or directory
+#
+# ## 이 결함이 왜 늦게 발견됐나
+#
+# **오류로 안 보인다.** 공식 postgres 엔트리포인트는 훅이 실패해도 멈추지 않고,
+# Postgres 는 그대로 뜨고 healthcheck(`pg_isready`)도 통과한다. 남는 것은
+# **확장도 graph 도 없는 빈 Postgres** 다. 게다가 훅은 PGDATA 가 비었을 때만 도는
+# 규약이라, 볼륨이 남아 있는 개발 머신에서는 애초에 실행되지 않아 증상이 안 난다.
+# 리눅스·macOS 빌드는 멀쩡해서 더 늦게 걸렸다.
+#
+# 방어는 두 겹이다. 여기(체크아웃)와 `Dockerfile.runtime`(빌드 시 CR 제거).
+# 한 겹만 두지 않는 이유는 zip 배포나 attributes 를 무시하는 클론이 있기 때문이다.
+
+*.sh text eol=lf
+*.bash text eol=lf
+
+# initdb 훅이 읽는 SQL 도 같이 맞춘다.
+*.sql text eol=lf
