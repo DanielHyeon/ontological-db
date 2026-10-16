@@ -577,6 +577,35 @@ impl Failure {
     /// (principle VIII). It is passed through verbatim; only the code is ours.
     fn from_pg(e: &postgres::Error) -> Self {
         let message = pg_message(e);
+
+        // **교착·직렬화 실패는 "질의가 틀렸다" 가 아니다 — 다시 하면 되는 것이다.**
+        //
+        // 여기에 분기가 없어서 둘 다 아래 `else` 로 떨어져
+        // `Neo.ClientError.Statement.ArgumentError` 가 됐다. 드라이버는 그것을
+        // "클라이언트 잘못" 으로 올리므로 **재시도하지 말라는 뜻**이 되고, 앱의
+        // `with_retry`(ingestion/event_storming/neo4j_ops/_bulk_helper.py)는
+        // 문구에서 `DeadlockDetected` 를 찾는데 PostgreSQL 은 `deadlock detected`
+        // 라고 쓴다 — **재시도 장치가 있는데 한 번도 안 걸렸다**(2026-10-16 재현).
+        //
+        // 표준 코드로 보내면 드라이버가 `TransientError` 를 올리고 문구에
+        // `DeadlockDetected` 가 들어가 **이미 있는 재시도가 그대로 걸린다.**
+        // 메시지는 건드리지 않는다 — PostgreSQL 의 설명이 가장 쓸모 있다.
+        if let Some(db) = e.as_db_error() {
+            let sqlstate = db.code().code();
+            if sqlstate == "40P01" {
+                return Failure::client(
+                    "Neo.TransientError.Transaction.DeadlockDetected",
+                    message,
+                );
+            }
+            if sqlstate == "40001" {
+                return Failure::client(
+                    "Neo.TransientError.Transaction.Terminated",
+                    message,
+                );
+            }
+        }
+
         let code = if message.contains("not supported")
             || message.contains("expected")
             || message.contains("unknown label")
