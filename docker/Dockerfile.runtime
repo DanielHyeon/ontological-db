@@ -32,19 +32,26 @@
 # =============================================================================
 # builder — 여기서만 Rust 를 쓴다. 산출물 외에는 아무것도 다음 단계로 안 넘어간다.
 # =============================================================================
-FROM debian:bookworm-slim AS builder
+FROM debian:trixie-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # PGDG 저장소 — 공식 postgres 이미지와 **같은 출처의 PostgreSQL 16** 을 쓴다.
 # 확장은 서버 ABI 에 묶이므로, 빌드한 쪽과 실행하는 쪽의 major 와 빌드가 맞아야 한다.
+#
+# **배포판은 trixie(Debian 13) 다.** 2026-10-16 실측에서 bookworm 이 넣는 deb 취약점이
+# `graphDb` 10건 · `graphBolt` 17건이었다(done13 §264). `runtime-db` 가 쓰는
+# `postgres:16-trixie` 도 같은 PGDG 의 trixie 빌드이므로 ABI 는 그대로 맞는다.
+#
+# ⚠ **major 는 16 에서 안 올린다.** 16 → 17 은 베이스 교체가 아니라 **데이터
+# 마이그레이션**이다 — 이미 깔린 PC 의 PGDATA 볼륨을 17 서버가 못 읽는다.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg lsb-release \
     && install -d /usr/share/postgresql-common/pgdg \
     && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
          -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
     && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
-https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+https://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
          > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update && apt-get install -y --no-install-recommends \
         postgresql-16 postgresql-server-dev-16 \
@@ -79,7 +86,7 @@ RUN cd bolt && cargo build --release
 # =============================================================================
 # runtime-db — Postgres + ontological + pgvector
 # =============================================================================
-FROM postgres:16-bookworm AS runtime-db
+FROM postgres:16-trixie AS runtime-db
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -117,10 +124,13 @@ RUN sed -i 's/\r$//' /docker-entrypoint-initdb.d/10-ontological-init.sh \
 # =============================================================================
 # runtime-bolt — 게이트웨이 단일 바이너리
 # =============================================================================
-FROM debian:bookworm-slim AS runtime-bolt
+FROM debian:trixie-slim AS runtime-bolt
 
+# **`libssl3` 이 아니라 `libssl3t64` 다.** trixie 는 64비트 time_t 전환으로 패키지
+# 이름이 바뀌었고 `libssl3` 은 아예 없다 — 옛 이름을 그대로 두면 빌드가 여기서 죽는다.
+# (죽는 것이 맞다. 조용히 안 깔리면 Bolt 가 런타임에 라이브러리를 못 찾는다.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 \
+        ca-certificates libssl3t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin bolt
 
