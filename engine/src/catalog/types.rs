@@ -7,6 +7,7 @@
 
 use crate::catalog::labeling;
 use pgrx::prelude::*;
+use pgrx::PgTryBuilder;
 
 /// Property types we are willing to materialise as columns. Anything else is
 /// rejected at declaration time rather than failing later at write time.
@@ -86,18 +87,71 @@ pub fn try_type_name(tid: i32) -> Option<String> {
     .flatten()
 }
 
+/// Is this alias name already spoken for by a type in **another** graph?
+///
+/// The alias view lives in one schema (`og_data`) and its name is the bare label,
+/// so `Event` in graph A and `Event` in graph B want the same object. The catalog
+/// lock is per graph (`lock_graph_catalog`), which is exactly the wrong shape for
+/// a schema-global name: it serialises the writers who *cannot* collide and leaves
+/// the ones who *can* running side by side.
+///
+/// Measured 2026-10-15: twenty concurrent creations of the same label name across
+/// two graphs failed three times with `pg_type_typname_nsp_index`; done serially,
+/// the second graph silently took the first graph's view, so reading
+/// `og_data."Event"` in SQL showed **the wrong graph**.
+fn alias_taken_by_other_graph(tid: i32, name: &str) -> bool {
+    crate::spiu::one::<bool>(
+        "SELECT EXISTS (
+           SELECT 1 FROM og_catalog.type t
+            WHERE t.name = $2
+              AND t.graph_id <> (SELECT graph_id FROM og_catalog.type WHERE type_id = $1)
+         )",
+        &[tid.into(), name.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 pub fn ensure_alias_view(tid: i32, name: &str, table: &str) {
+    // **Do not take a name another graph is using.** Dropping and recreating would
+    // leave that graph's alias pointing here, and a person reading `og_data."Event"`
+    // would get rows from a project they did not ask about. The convenience is not
+    // worth that; the graph that got there first keeps the name.
+    if alias_taken_by_other_graph(tid, name) {
+        pgrx::log!(
+            "alias view for type {tid} ({name}) skipped: another graph already uses that name"
+        );
+        return;
+    }
+
     let view = alias_view_name(name);
     // A type name is user input; quoting is what makes that safe here.
-    let _ = Spi::run(&format!("DROP VIEW IF EXISTS {view}"));
-    if let Err(e) = Spi::run(&format!(
-        "CREATE VIEW {view}{} AS SELECT * FROM {table}",
-        crate::spiu::VIEW_SECURITY
-    )) {
-        // Never fatal: the view is a convenience, and a name that collides with
-        // something already in the schema must not stop a type from existing.
-        pgrx::log!("could not create the alias view for type {tid} ({name}): {e}");
-    } else {
+    //
+    // **The whole pair runs inside a subtransaction.** The old code caught the
+    // `Err` and logged it, calling itself "never fatal" — but a failed statement
+    // aborts the surrounding transaction in PostgreSQL, so catching the Rust-side
+    // error changed nothing: the caller died anyway with `duplicate key value
+    // violates unique constraint "pg_type_typname_nsp_index"`. That is how a
+    // convenience feature took down eleven writes in one ingestion run
+    // (2026-10-15). `PgTryBuilder` is what this repository uses for exactly this
+    // (docs/05_llm/03_correctable_errors.md).
+    let created = PgTryBuilder::new(|| {
+        let _ = Spi::run(&format!("DROP VIEW IF EXISTS {view}"));
+        Spi::run(&format!(
+            "CREATE VIEW {view}{} AS SELECT * FROM {table}",
+            crate::spiu::VIEW_SECURITY
+        ))
+        .is_ok()
+    })
+    .catch_others(|_| {
+        // Never fatal — and now that is true rather than intended.
+        pgrx::log!("could not create the alias view for type {tid} ({name})");
+        false
+    })
+    .execute();
+
+    if created {
         crate::catalog::privileges::apply_to_view(tid, &view);
     }
 }
