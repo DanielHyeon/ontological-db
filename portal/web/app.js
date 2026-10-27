@@ -17,6 +17,11 @@ const state = {
   saved: JSON.parse(localStorage.getItem('og.saved') || '[]'),
   history: JSON.parse(localStorage.getItem('og.history') || '[]'),
   histIdx: -1,
+  at: { valid_at: '', system_at: '', system_label: '' },  // time travel (spec 013)
+  // Query parameters set with `:param`. Kept in memory only: a parameter is
+  // where a secret goes so that it stays out of the query text, and the query
+  // text is what the history below writes to localStorage.
+  params: {},
 };
 
 /** Stable label colouring: the same type keeps its colour across frames. */
@@ -170,13 +175,14 @@ function renderSaved() {
 
 let frameSeq = 0;
 
-function addFrame(title) {
+function addFrame(title, badge = '') {
   const id = `f${++frameSeq}`;
   const el = document.createElement('div');
   el.className = 'frame';
   el.id = id;
   el.innerHTML = `
     <header>
+      ${badge ? `<span class="asof-badge">${escapeHtml(badge)}</span>` : ''}
       <span class="qtext">${escapeHtml(title)}</span>
       <div class="tabs"></div>
       <button class="save mini" title="save query">★</button>
@@ -660,9 +666,46 @@ function showInspector(d) {
 
 // ------------------------------------------------------------------- runner ---
 
+/**
+ * `:param name => value` sets a query parameter, `:params` lists the names,
+ * `:params clear` forgets them. The value is parsed as JSON when it is JSON
+ * (`5`, `true`, `"x"`, `[1,2]`), and taken as a string otherwise, with one
+ * layer of quotes removed. Neither the command nor the value enters history.
+ */
+function paramCommand(query) {
+  const note = (text) => {
+    const frame = addFrame(query.replace(/=>.*$/s, '=> …'));
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:12px 16px;font-family:var(--mono);font-size:12.5px';
+    div.textContent = text;
+    setViews(frame, [{ name: 'Result', node: div }], '<span>parameters</span>');
+    $('#editor').value = '';
+    autosize();
+  };
+  if (query === ':params') {
+    const names = Object.keys(state.params);
+    return note(names.length ? names.map((n) => `$${n}`).join(', ') + ' — values are not shown' : 'no parameters set');
+  }
+  if (query === ':params clear') {
+    state.params = {};
+    return note('parameters cleared');
+  }
+  const m = query.match(/^:param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*([\s\S]+)$/);
+  if (!m) return note('usage — :param name => value');
+  let value = m[2].trim();
+  try {
+    value = JSON.parse(value);
+  } catch {
+    value = value.replace(/^'([\s\S]*)'$/, '$1');
+  }
+  state.params[m[1]] = value;
+  return note(`$${m[1]} set for this page — not saved, not shown`);
+}
+
 async function run() {
   const query = $('#editor').value.trim();
   if (!query) return;
+  if (query.startsWith(':param')) return paramCommand(query);
 
   state.history.unshift(query);
   state.history = state.history.slice(0, 100);
@@ -675,7 +718,8 @@ async function run() {
     return;
   }
 
-  const frame = addFrame(query);
+  const instant = asOfInstant();
+  const frame = addFrame(query, query.startsWith(':') ? '' : asOfBadge());
   $('#editor').value = '';
   autosize();
 
@@ -683,9 +727,13 @@ async function run() {
   if (query.startsWith(':explain ')) return runExplain(frame, query.slice(9));
   if (query.startsWith(':why ')) return runWhy(frame, query.slice(5));
   if (query === ':schema') return runSchemaCmd(frame);
+  if (query === ':changes') return runChangesCmd(frame);
+  if (query === ':snapshot' || query.startsWith(':snapshot ')) return runSnapshotCmd(frame, query.slice(9).trim());
+  if (query === ':releases') return runReleasesCmd(frame);              // release.js
+  if (query.startsWith(':timeline')) return runTimelineCmd(frame, query.slice(9)); // release.js
 
   const t0 = performance.now();
-  const { ok, data } = await api('/api/cypher', { graph: state.graph, query, params: {} });
+  const { ok, data } = await api('/api/cypher', { graph: state.graph, query, params: state.params, at: instant });
   const ms = (performance.now() - t0).toFixed(0);
 
   if (!ok) {
@@ -714,7 +762,8 @@ async function run() {
     views,
     `<span class="ok">${data.rows.length} row${data.rows.length === 1 ? '' : 's'}</span>
      <span>${data.graph.nodes.length} nodes · ${data.graph.edges.length} relationships</span>
-     <span>server ${data.elapsed_ms} ms · round trip ${ms} ms</span>`
+     <span>server ${data.elapsed_ms} ms · round trip ${ms} ms</span>
+     ${data.sql_fingerprint ? `<span>compiled SQL <span class="fp">${data.sql_fingerprint}</span></span>` : ''}`
   );
   loadSchema();
   loadAudit();
@@ -786,6 +835,37 @@ async function runWhy(frame, query) {
   setViews(frame, [{ name: 'Diagnosis', node: box }], '<span>diagnostics</span>');
 }
 
+/** `:changes` — every recorded schema change (spec 012). */
+async function runChangesCmd(frame) {
+  const { ok, data } = await api(`/api/schema-changes?graph=${encodeURIComponent(state.graph)}`, null, 'GET');
+  if (!ok) { setViews(frame, [{ name: 'Error', node: errorView(data, ':changes') }], '<span class="bad">failed</span>'); return; }
+  const rows = data.map((c) => ({ change_id: c.change_id, kind: c.kind, phase: c.phase, spec: c.spec }));
+  setViews(frame, [{ name: 'Table', node: tableView(rows, ['change_id', 'kind', 'phase', 'spec']) },
+                   { name: 'JSON', node: codeView(JSON.stringify(data, null, 2)) }],
+    `<span class="ok">${data.length} changes</span><span>og_schema_changes</span>`);
+}
+
+/**
+ * `:snapshot [version | instant]` — the catalog as it stood then. Properties
+ * are shown with the column they map to: a renamed property keeps the column
+ * it was born with.
+ */
+async function runSnapshotCmd(frame, arg) {
+  const q = /^\d+$/.test(arg) ? `&version=${arg}` : arg ? `&at=${encodeURIComponent(arg)}` : '';
+  const { ok, data } = await api(`/api/schema-snapshot?graph=${encodeURIComponent(state.graph)}${q}`, null, 'GET');
+  if (!ok) { setViews(frame, [{ name: 'Error', node: errorView(data, ':snapshot') }], '<span class="bad">failed</span>'); return; }
+  const rows = [];
+  for (const t of data.types || []) {
+    for (const [name, p] of Object.entries(t.properties || {})) {
+      rows.push({ type: t.name, parents: (t.parents || []).join(', '), property: name, type_sql: p.type, column: p.column });
+    }
+    if (!Object.keys(t.properties || {}).length) rows.push({ type: t.name, parents: (t.parents || []).join(', ') });
+  }
+  setViews(frame, [{ name: 'Table', node: tableView(rows, ['type', 'parents', 'property', 'type_sql', 'column']) },
+                   { name: 'JSON', node: codeView(JSON.stringify(data, null, 2)) }],
+    `<span class="ok">schema version ${data.version}</span><span>${escapeHtml(data.description || '')}</span>`);
+}
+
 async function runSchemaCmd(frame) {
   const { ok, data } = await api(`/api/schema?graph=${encodeURIComponent(state.graph)}`, null, 'GET');
   if (!ok) return;
@@ -811,6 +891,64 @@ function autosize() {
   const ta = $('#editor');
   ta.style.height = 'auto';
   ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * 0.4) + 'px';
+}
+
+
+// ------------------------------------------------------------ time travel ---
+// Spec 013: the instant is a session setting, so the query in the editor is
+// sent unchanged — only `at` differs. Recent writes from the audit log are
+// offered as "as we believed right after this" system-time instants.
+
+function asOfInstant() {
+  const at = {};
+  if (state.at.valid_at) at.valid_at = state.at.valid_at;
+  if (state.at.system_at) at.system_at = state.at.system_at;
+  return Object.keys(at).length ? at : null;
+}
+
+function asOfBadge() {
+  const parts = [];
+  if (state.at.valid_at) parts.push(`valid ${state.at.valid_at}`);
+  if (state.at.system_at) parts.push(`known ${state.at.system_label || state.at.system_at}`);
+  return parts.length ? '⏱ ' + parts.join(' · ') : '';
+}
+
+function syncTimeUi() {
+  const on = !!asOfInstant();
+  $('#editor-wrap').classList.toggle('asof', on);
+  $('#time-btn').classList.toggle('on', on || !$('#time-bar').classList.contains('hidden'));
+}
+
+async function loadTemporal() {
+  const { ok, data } = await api(`/api/temporal?graph=${encodeURIComponent(state.graph)}`, null, 'GET');
+  if (!ok) return;
+  const sel = $('#tb-system');
+  const keep = sel.value;
+  const fmt = (t) => new Date(t).toLocaleTimeString('en-GB', { hour12: false }) +
+    '.' + String(new Date(t).getMilliseconds()).padStart(3, '0');
+  sel.innerHTML = '<option value="">now</option>' + data.writes.map((w) => {
+    const what = (w.query || '').replace(/\s+/g, ' ').slice(0, 54);
+    return `<option value="${escapeHtml(w.at)}" data-label="${escapeHtml(fmt(w.at) + (w.actor ? ' · ' + w.actor : ''))}">` +
+      `after ${escapeHtml(fmt(w.at))}${w.actor ? ' · ' + escapeHtml(w.actor) : ''} — ${escapeHtml(what)}</option>`;
+  }).join('');
+  sel.value = keep;
+  $('#tb-note').textContent = data.types.length
+    ? `temporal types: ${data.types.join(', ')} — the query text does not change; the instant is a session setting`
+    : 'no temporal types in this graph — enable with og_enable_temporal(graph, type)';
+}
+
+// --------------------------------------------------------- schema changes ---
+// Spec 012. The designer (designer.js) stages and runs changes; this keeps the
+// sidebar history of og_schema_changes.
+
+async function loadEvo() {
+  const { ok, data } = await api(`/api/schema-changes?graph=${encodeURIComponent(state.graph)}`, null, 'GET');
+  if (!ok) return;
+  $('#evo-list').innerHTML = data.map((c) =>
+    `<div class="row" data-evo-id="${c.change_id}"><span class="k">#${c.change_id} ${escapeHtml(c.kind)}</span>` +
+    `<span class="p ${c.phase === 'aborted' ? 'aborted' : ''}">${escapeHtml(c.phase)}</span>` +
+    `<div style="color:var(--fg-dim)">${escapeHtml(JSON.stringify(c.spec))}</div></div>`).join('') ||
+    '<div class="pane">no schema changes yet</div>';
 }
 
 // ------------------------------------------------------------------- wiring ---
@@ -847,6 +985,8 @@ $$('.rail-btn[data-panel]').forEach((btn) => {
     );
     if (btn.dataset.panel === 'audit') loadAudit();
     if (btn.dataset.panel === 'saved') renderSaved();
+    if (btn.dataset.panel === 'evolve') loadEvo();
+    if (typeof openDesigner === 'function') openDesigner(btn.dataset.panel === 'evolve');
   };
 });
 
@@ -854,7 +994,28 @@ $('#graph-select').onchange = (e) => {
   state.graph = e.target.value;
   localStorage.setItem('og.graph', state.graph);
   loadSchema();
+  loadTemporal();
+  loadEvo();
+  if (typeof D !== 'undefined' && D.open) loadDesigner();
 };
+
+$('#time-btn').onclick = () => {
+  $('#time-bar').classList.toggle('hidden');
+  loadTemporal();
+  syncTimeUi();
+};
+$('#tb-valid').oninput = (e) => { state.at.valid_at = e.target.value.trim(); syncTimeUi(); };
+$('#tb-system').onchange = (e) => {
+  state.at.system_at = e.target.value;
+  state.at.system_label = e.target.selectedOptions[0]?.dataset.label || '';
+  syncTimeUi();
+};
+$('#tb-clear').onclick = () => {
+  state.at = { valid_at: '', system_at: '', system_label: '' };
+  $('#tb-valid').value = ''; $('#tb-system').value = '';
+  syncTimeUi();
+};
+$('#evo-refresh').onclick = loadEvo;
 
 $('#insp-close').onclick = () => $('#inspector').classList.add('hidden');
 
@@ -876,5 +1037,5 @@ document.addEventListener('click', (e) => {
   }
 });
 
-loadHealth();
+loadHealth().then(() => { loadTemporal(); loadEvo(); });
 renderSaved();

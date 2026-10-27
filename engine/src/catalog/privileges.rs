@@ -37,7 +37,7 @@ use pgrx::prelude::*;
 /// Introspection, query and statistics. Read privileges on the tables are what
 /// make these safe; see the module note on `og_cypher`.
 const READ: &[&str] = &[
-    "og_apoc_meta_schema", "og_as_of", "og_build_view", "og_check_integrity",
+    "og_apoc_meta_schema", "og_as_of", "og_check_integrity",
     "og_csr_hops",
     "og_csr_reach", "og_csr_stats", "og_cypher", "og_cypher_check",
     "og_cypher_columns", "og_cypher_explain", "og_cypher_json", "og_cypher_sql",
@@ -52,6 +52,20 @@ const READ: &[&str] = &[
     "og_subtypes", "og_supertypes", "og_type_id", "og_type_name", "og_typeql",
     "og_typeql_check", "og_typeql_schema", "og_typeql_sql", "og_vector_search",
     "og_vector_search_exact", "og_vlp",
+    // Point-in-time context and the helpers generated views call (spec 013).
+    "og_asof_active", "og_require_current", "og_system_at", "og_valid_at",
+    "og_temporal_types",
+    // Write-time security (spec 014). `og_type_priv` is evaluated inside
+    // registry policies as the caller; `og__audit` and `og__ensure_view` are
+    // SECURITY DEFINER and take nothing a caller could abuse; `og_run_action`
+    // is gated by EXECUTE on each action's own function.
+    "og__audit", "og__ensure_view", "og_meta", "og_run_action", "og_type_priv",
+    // Called by triggers that run as the writer. Pure; they touch only NEW.
+    "og__visible", "og__shadow_write",
+    // Schema evolution: reading the record is not changing the schema.
+    "og_schema_changes", "og_schema_snapshot",
+    // Releases and timelines: comparing, listing and reading history change nothing.
+    "og_schema_diff", "og_releases", "og_timeline",
 ];
 
 /// Data manipulation. `og_genai_encode` is here rather than under `admin`
@@ -216,6 +230,10 @@ fn og_grant(
             "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA og_data TO {r}"
         ))
         .unwrap_or_else(|e| error!("sequence grant failed: {e}"));
+        // Except the records *about* writers. The audit log, the history and
+        // provenance tables are written by SECURITY DEFINER functions and
+        // triggers; a writer holding DML on them could edit its own trail.
+        protect_records(&r);
     }
     if rank >= 3 {
         Spi::run(&format!(
@@ -272,6 +290,46 @@ fn og_revoke(role: &str, graph: default!(&str, "'*'")) {
     }
     Spi::run_with_args("DELETE FROM og_catalog.grantee WHERE role = $1", &[role.into()])
         .unwrap_or_else(|e| error!("could not clear the grant record: {e}"));
+    Spi::run_with_args("DELETE FROM og_catalog.write_grant WHERE role = $1", &[role.into()])
+        .unwrap_or_else(|e| error!("could not clear the write grant record: {e}"));
+}
+
+/// Revoke DML on the tables that record what writers did.
+fn protect_records(quoted_role: &str) {
+    let mut tables = vec![
+        "og_data.og_audit".to_string(),
+        "og_data.og_history".to_string(),
+        "og_data.og_source".to_string(),
+    ];
+    tables.extend(history_tables());
+    for t in tables {
+        Spi::run(&format!(
+            "REVOKE INSERT, UPDATE, DELETE ON {} FROM {quoted_role}",
+            spiu::qname(&t)
+        ))
+        .unwrap_or_else(|e| error!("revoke on {t} failed: {e}"));
+    }
+}
+
+fn history_tables() -> Vec<String> {
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT 'og_data.' || c.relname FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'og_data' AND c.relkind = 'r' AND c.relname LIKE 'h\\_%'",
+                None,
+                &[],
+            )
+            .map(|rows| rows.filter_map(|r| r.get::<String>(1).ok().flatten()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// `EXECUTE` on the read and write function lists, for a role that writes
+/// through `og_grant_write` rather than holding the `write` level.
+pub fn grant_write_functions(quoted_role: &str) {
+    grant_functions(quoted_role, 2);
 }
 
 /// The schema the extension was installed into, unquoted.
@@ -347,6 +405,16 @@ fn grant_functions(quoted_role: &str, rank: i32) {
 /// rather than raised: a missing grant must not be the reason a type cannot be
 /// created, and `og_grant` re-run repairs it.
 pub fn apply_to_table(tid: i32, table: &str) {
+    // History tables are written only by the SECURITY DEFINER capture trigger,
+    // so human roles get SELECT replayed and nothing else (spec 014, upstream).
+    let record_only = table.starts_with("og_data.h_");
+    // The scope is `reaching(tid)`, not every recorded grant. Upstream still had
+    // the unscoped form here because it does not carry our graph scoping yet —
+    // replaying every grant onto every new table is the exact behaviour that made
+    // scoping decay, and `reaching`'s own doc comment records why. Keeping the
+    // type id in the signature is what lets both intents hold at once; the one
+    // caller that had none (the history table in `temporal::enable_table`) does
+    // have a type id, so it passes it.
     for (role, level) in reaching(tid) {
         let r = spiu::ident(&role);
         // Interpolated as given, not re-quoted. Every caller builds its own DDL
@@ -359,7 +427,7 @@ pub fn apply_to_table(tid: i32, table: &str) {
         if let Err(e) = Spi::run(&format!("GRANT SELECT ON {t} TO {r}")) {
             pgrx::log!("could not grant SELECT on {table} to {role}: {e}");
         }
-        if level_rank(&level) >= 2 {
+        if level_rank(&level) >= 2 && !record_only {
             if let Err(e) = Spi::run(&format!("GRANT INSERT, UPDATE, DELETE ON {t} TO {r}")) {
                 pgrx::log!("could not grant DML on {table} to {role}: {e}");
             }
@@ -405,16 +473,7 @@ fn reaching(tid: i32) -> Vec<(String, String)> {
     })
 }
 
-fn recorded() -> Vec<(String, String)> {
-    Spi::connect(|client| {
-        client
-            .select("SELECT role, level FROM og_catalog.grantee ORDER BY role, graph", None, &[])
-            .map(|rows| {
-                rows.filter_map(|r| {
-                    Some((r.get::<String>(1).ok()??, r.get::<String>(2).ok()??))
-                })
-                .collect()
-            })
-            .unwrap_or_default()
-    })
-}
+// `recorded()` — every grant regardless of graph — was removed with the merge.
+// Its only caller was the unscoped `apply_to_table`, and replaying grants that
+// way is what `reaching` exists to prevent. Reintroduce it only with a caller
+// that genuinely wants cross-graph reach, and say so there.

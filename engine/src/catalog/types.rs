@@ -136,6 +136,12 @@ pub fn ensure_alias_view(tid: i32, name: &str, table: &str) {
     // convenience feature took down eleven writes in one ingestion run
     // (2026-10-15). `PgTryBuilder` is what this repository uses for exactly this
     // (docs/05_llm/03_correctable_errors.md).
+    //
+    // 상류는 이 자리를 하위 트랜잭션 없이 두고, 대신 `apply_to_view` 에
+    // `og_data.{name}`(따옴표 없는 꼴)을 넘겨 이중 따옴표 문제를 피했다.
+    // 우리는 그 문제를 **받는 쪽에서** 고쳤다 — `apply_to_*` 가 받은 이름을
+    // 다시 따옴표로 싸지 않는다(privileges.rs 의 그 긴 주석이 경위다).
+    // 그래서 여기서는 우리 꼴을 지킨다: 하위 트랜잭션은 **포기할 수 없다**.
     let created = PgTryBuilder::new(|| {
         let _ = Spi::run(&format!("DROP VIEW IF EXISTS {view}"));
         Spi::run(&format!(
@@ -524,10 +530,46 @@ pub fn create_type_inner(
     .expect("id alloc init failed");
 
     labeling::relabel_graph(gid);
+
+    // Settings declared on an ancestor reach a subtype created later: the
+    // labels above are what make the ancestry visible, so this comes after.
+    if !is_abstract && k != 'a' {
+        if crate::security::inherits_stamping(tid) {
+            if let Some(table) = storage_table(tid) {
+                crate::security::stamp_table(&table);
+            }
+        }
+        if crate::temporal::is_temporal(tid) {
+            crate::temporal::enable_table(tid);
+        }
+        inherit_history_capture(graph, tid);
+        crate::security::replay_write_grants(tid);
+    }
     tid
 }
 
-fn copy_inherited_properties(parent: i32, child: i32, child_table: &str) {
+/// `og_enable_history` on an ancestor covers a subtype created afterwards.
+fn inherit_history_capture(graph: &str, tid: i32) {
+    let on = crate::spiu::one::<bool>(
+        "SELECT true FROM og_catalog.setting s
+           JOIN og_catalog.type t ON s.key = 'history.' || $1 || '.' || t.name
+          WHERE t.type_id = ANY($2) AND s.value = 'on' LIMIT 1",
+        &[graph.into(), labeling::og_supertypes(tid).into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if let (true, Some(table)) = (on, storage_table(tid)) {
+        Spi::run(&format!(
+            "CREATE OR REPLACE TRIGGER og_hist_{tid}
+               AFTER INSERT OR UPDATE OR DELETE ON {table}
+               FOR EACH ROW EXECUTE FUNCTION og_capture_history()"
+        ))
+        .unwrap_or_else(|e| error!("failed to enable history on {table}: {e}"));
+    }
+}
+
+pub fn copy_inherited_properties(parent: i32, child: i32, child_table: &str) {
     let props: Vec<(String, String, String, bool, bool)> = Spi::connect(|client| {
         client
             .select(
@@ -597,8 +639,11 @@ fn og_add_property(
     let col = column_name(prop);
 
     if required {
+        // Relation instances live in og_edge, not og_node; counting only nodes
+        // let a required property onto a relation type with edges in it.
         let n = crate::spiu::one::<i64>(
-            "SELECT count(*) FROM og_data.og_node WHERE type_id = ANY($1)",
+            "SELECT (SELECT count(*) FROM og_data.og_node WHERE type_id = ANY($1))
+                  + (SELECT count(*) FROM og_data.og_edge WHERE type_id = ANY($1))",
             &[labeling::og_subtypes(tid).into()],
         )
         .expect("count failed")
@@ -650,6 +695,7 @@ fn og_add_property(
                 ))
                 .expect("unique index failed");
             }
+            crate::temporal::sync_history(sub);
             if sub != tid {
                 Spi::run_with_args(
                     "INSERT INTO og_catalog.property
@@ -670,6 +716,8 @@ fn og_add_property(
         if let (Some(table), Some(sub_name)) = (storage_table(sub), try_type_name(sub)) {
             ensure_alias_view(sub, &sub_name, &table);
         }
+        // A grant on "every property" of a type covers this column too.
+        crate::security::replay_write_grants(sub);
     }
     labeling::bump_schema_version(gid, &format!("add property {type_name}.{prop}"));
 }
@@ -686,6 +734,7 @@ fn og_create_index(graph: &str, type_name: &str, prop: &str) {
                 .expect("index creation failed");
         }
     }
+    labeling::bump_schema_version(gid, &format!("create index {type_name}.{prop}"));
 }
 
 pub fn storage_table(tid: i32) -> Option<String> {

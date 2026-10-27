@@ -178,8 +178,8 @@ END $$;
 
 \echo '--- a reader can build a view that a schema change invalidated ---'
 -- Views are built on first read after a schema change, and that first read can
--- come from any role. `og_build_view` was gated behind a grant, so a reader hit
--- `permission denied for function og_build_view` at an arbitrary later moment.
+-- come from any role. `og__ensure_view` was gated behind a grant, so a reader hit
+-- `permission denied for function og__ensure_view` at an arbitrary later moment.
 -- The grant list does name it, but function grants are issued once and never
 -- replayed — so a role granted before an engine upgrade never receives a
 -- function the upgrade added. Reproduced here the way it actually happens: the
@@ -188,7 +188,7 @@ END $$;
 -- The stale-grant state, made explicit: the role holds its table grants but not
 -- EXECUTE on the builder — exactly where an upgrade that adds a function leaves
 -- every role granted before it.
-REVOKE EXECUTE ON FUNCTION og_build_view(int4, bool) FROM og_test_alpha;
+REVOKE EXECUTE ON FUNCTION og__ensure_view(int4, bool) FROM og_test_alpha;
 
 DO $$
 DECLARE n int;
