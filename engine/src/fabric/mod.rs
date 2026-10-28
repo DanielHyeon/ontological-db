@@ -90,7 +90,10 @@ fn og_create_datasource(name: &str, engine: &str, params: JsonB) -> String {
                 format!("user {}, password {}", lit(&user), lit(&password)),
             )
         }
-        "mysql" | "mindsdb" => {
+        // `mariadb` 는 MySQL 과 같은 통신 규약이고 `mysql_fdw` 가 그대로 붙는다.
+        // 이름이 없어서 화면이 고르게 해 둔 `mariadb` 가 "unsupported" 로
+        // 떨어지고 있었다(ISS-70 · 2026-10-29).
+        "mysql" | "mariadb" | "mindsdb" => {
             let port = param(&p, "port")
                 .unwrap_or_else(|| if engine == "mindsdb" { "47335".into() } else { "3306".into() });
             (
@@ -99,7 +102,9 @@ fn og_create_datasource(name: &str, engine: &str, params: JsonB) -> String {
                 format!("username {}, password {}", lit(&user), lit(&password)),
             )
         }
-        other => error!("unsupported datasource engine '{other}': postgres, mysql, mindsdb"),
+        other => error!(
+            "unsupported datasource engine '{other}': postgres, mysql, mariadb, mindsdb"
+        ),
     };
 
     Spi::run(&format!("CREATE EXTENSION IF NOT EXISTS {fdw}"))
@@ -197,7 +202,7 @@ fn protect_server(server: &str) {
 fn default_remote_schema(engine: &str, p: &Map<String, Value>) -> Option<String> {
     match engine {
         "postgres" | "postgresql" => param(p, "schema"),
-        "mysql" => param(p, "database"),
+        "mysql" | "mariadb" | "mindsdb" => param(p, "database"),
         _ => None,
     }
 }

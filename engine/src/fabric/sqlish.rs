@@ -458,7 +458,18 @@ fn split_as_query(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn translate(stmt: &str, graph: Option<&str>, params: &Map<String, Value>) -> R<String> {
+/// 문장을 SQL 로 옮긴다.
+///
+/// ⚠ `bound` 는 **문장에 박으면 안 되는 값**이 나가는 길이다. 지금은
+/// `CREATE DATASOURCE` 의 파라미터 블록 하나뿐이다 — 거기에 원천 DB 의
+/// 비밀번호가 들어 있고, 박아 넣으면 postgres 가 **실패한 문장을 서버 로그에
+/// 그대로 기록**한다(ISS-68). 돌려받은 쪽이 `$1` 로 바인드한다.
+fn translate(
+    stmt: &str,
+    graph: Option<&str>,
+    params: &Map<String, Value>,
+    bound: &mut Option<String>,
+) -> R<String> {
     let s = trim_statement(stmt);
     if s.is_empty() {
         return Err("empty statement".into());
@@ -521,9 +532,14 @@ fn translate(stmt: &str, graph: Option<&str>, params: &Map<String, Value>) -> R<
                 _ => return Err(format!("expected PARAMETERS = {{ … }}{}", p.near())),
             };
             p.i += 1;
+            // ⚠ **여기에 비밀번호가 있다.** 박지 않고 `$1` 로 넘긴다 —
+            //    기본값에서 postgres 는 바인드 값을 오류 로그에 적지 않는다
+            //    (`log_parameter_max_length_on_error` 가 0).
+            //    이름과 엔진은 이미 식별자로 검사된 값이라 그대로 둔다.
+            *bound = Some(json);
             format!(
-                "SELECT og_create_datasource({}, {}, {}::jsonb) AS result",
-                lit(&name), lit(&engine), lit(&json)
+                "SELECT og_create_datasource({}, {}, $1::jsonb) AS result",
+                lit(&name), lit(&engine)
             )
         } else if p.kw("VIRTUAL") {
             if p.kw("NODE") {
@@ -705,7 +721,9 @@ fn og_fabric_translate(statement: &str, params: default!(JsonB, "'{}'")) -> Stri
         Value::Object(m) => m,
         _ => Map::new(),
     };
-    translate(statement, None, &p).unwrap_or_else(|e| error!("fabric statement: {e}"))
+    // 보여 주기만 한다 — 가려야 할 값은 `$1` 로 남아 문장에 안 들어간다.
+    let mut bound = None;
+    translate(statement, None, &p, &mut bound).unwrap_or_else(|e| error!("fabric statement: {e}"))
 }
 
 /// Run a fabric statement or a Cypher query, one jsonb object per result row —
@@ -737,7 +755,8 @@ pub fn run(statement: &str, graph: Option<&str>, params: &Map<String, Value>) ->
         )
         .ok();
     };
-    let sql = match translate(statement, graph, params) {
+    let mut bound: Option<String> = None;
+    let sql = match translate(statement, graph, params, &mut bound) {
         Ok(sql) => sql,
         Err(e) => {
             audit(0, Some(&e));
@@ -745,8 +764,13 @@ pub fn run(statement: &str, graph: Option<&str>, params: &Map<String, Value>) ->
         }
     };
     let rows: Vec<Value> = Spi::connect_mut(|client| {
-        client
-            .update(&format!("SELECT to_jsonb(t) FROM ({sql}) t"), None, &[])
+        let q = format!("SELECT to_jsonb(t) FROM ({sql}) t");
+        // ⚠ 가려야 할 값은 **바인드로만** 간다(ISS-68). 문장에는 `$1` 만 있다.
+        let result = match bound.as_deref() {
+            Some(value) => client.update(&q, None, &[value.into()]),
+            None => client.update(&q, None, &[]),
+        };
+        result
             .unwrap_or_else(|e| error!("{e}"))
             .filter_map(|r| r.get::<JsonB>(1).ok().flatten().map(|j| j.0))
             .collect()
@@ -765,7 +789,8 @@ pub fn shown_sql(statement: &str, graph: &str) -> R<String> {
                    the parameters are not shown"
             .to_string());
     }
-    translate(statement, Some(graph), &Map::new())
+    let mut bound = None;
+    translate(statement, Some(graph), &Map::new(), &mut bound)
 }
 
 /// A node type defined by a query: the query becomes a view, the view the type.
