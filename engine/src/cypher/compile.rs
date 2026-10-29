@@ -2178,7 +2178,26 @@ impl Compiler {
                     "size" | "length" => format!("jsonb_array_length({c})"),
                     _ => {
                         let i = self.expr(&args[1], None)?;
-                        format!("({c} -> ({i})::int)")
+                        // ⚠ `x[i]` 는 **한 문법에 두 연산**이다 — `i` 가 숫자면 리스트
+                        // 색인, 문자열이면 맵 조회다. 무조건 `::int` 로 만들면
+                        // `n[k] for k IN keys(n)` — 노드의 속성을 도는 **보통의 길** —
+                        // 이 `cannot cast jsonb string to type integer` 로 죽는다.
+                        //
+                        // ⚠ 2026-10-29 실측: 상류 고침(9b88b3a)이 아래쪽 함수 갈래에
+                        // 같은 판단을 더했는데, **여기서 먼저 잡아** 닿지 않았다.
+                        // 한 이름을 두 곳에서 다루면 앞의 것이 이긴다.
+                        //
+                        // 키의 타입을 컴파일 시점에 알면 연산자를 바로 내고, 모르면
+                        // (리스트 내포의 바인더는 jsonb 다) 값의 json 타입으로 고른다.
+                        match self.type_of(&args[1]).as_deref() {
+                            Some("int8") => format!("({c} -> ({i})::int)"),
+                            Some("text") => format!("({c} -> ({i})::text)"),
+                            _ => format!(
+                                "(CASE WHEN jsonb_typeof(to_jsonb({i})) = 'number' \
+                                 THEN {c} -> ((to_jsonb({i}) #>> '{{}}')::int) \
+                                 ELSE {c} -> (to_jsonb({i}) #>> '{{}}') END)"
+                            ),
+                        }
                     }
                 });
             }
@@ -2318,29 +2337,11 @@ impl Compiler {
             // leaving `_id`/`_type` in would both invent properties the caller
             // never set and make the driver hydrate the result as a node.
             "properties" => format!("(({}) - '_id' - '_type')", a[0]),
-            // `x[i]` is two different operations wearing one syntax: list
-            // indexing when `i` is a number, map lookup when it is a string.
-            // Compiling it as `-> int` unconditionally made
-            // `n[k] for k IN keys(n)` — the ordinary way to walk a node's
-            // properties — fail with "cannot cast jsonb string to type
-            // integer".
-            //
-            // Where the key's type is known at compile time, emit the operator
-            // directly. Where it is not (a comprehension binder holds jsonb),
-            // decide on the value's own json type at run time.
-            "element_at" => {
-                let obj = &a[0];
-                let idx = &a[1];
-                match self.type_of(&args[1]).as_deref() {
-                    Some("int8") => format!("({obj} -> ({idx})::int)"),
-                    Some("text") => format!("({obj} -> ({idx})::text)"),
-                    _ => format!(
-                        "(CASE WHEN jsonb_typeof(to_jsonb({idx})) = 'number' \
-                         THEN {obj} -> ((to_jsonb({idx}) #>> '{{}}')::int) \
-                         ELSE {obj} -> (to_jsonb({idx}) #>> '{{}}') END)"
-                    ),
-                }
-            }
+            // ⚠ `element_at` 는 **여기 오지 않는다** — 위쪽 리스트 갈래에서
+            // early return 된다(그쪽에 타입 판단이 들어 있다). 상류 9b88b3a 가
+            // 여기에 같은 갈래를 더했었는데 닿지 않아 걷어냈다. 한 이름을 두
+            // 곳에서 다루면 앞의 것이 이기고, 뒤의 것은 **고친 줄 알고 넘어가게**
+            // 만든다(2026-10-29 에 실제로 그랬다).
             "nodes" | "relationships" => a[0].clone(),
             // spec 004 — vector surface
             "vector.similarity" | "similarity" => {

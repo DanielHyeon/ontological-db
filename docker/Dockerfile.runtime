@@ -66,6 +66,7 @@ https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
     && apt-get update && apt-get install -y --no-install-recommends \
         postgresql-16 postgresql-server-dev-16 \
         build-essential pkg-config git \
+        postgresql-16-mysql-fdw \
         libssl-dev libclang-dev clang libreadline-dev zlib1g-dev flex bison \
     && rm -rf /var/lib/apt/lists/*
 
@@ -111,9 +112,35 @@ ENV PATH=/usr/lib/postgresql/16/bin:$PATH
 RUN groupadd --system --gid 999 postgres  && useradd --system --gid postgres --uid 999       --home-dir /var/lib/postgresql --shell /bin/bash postgres  && mkdir -p /var/lib/postgresql /var/run/postgresql  && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql
 
 # PGDG 의 postgresql-16 — builder 와 **같은 출처·같은 배포판**이라 확장 ABI 가 맞는다.
-RUN apt-get update && apt-get install -y --no-install-recommends         ca-certificates curl gnupg locales  && install -d /usr/share/postgresql-common/pgdg  && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc       -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main"       > /etc/apt/sources.list.d/pgdg.list  && apt-get update && apt-get install -y --no-install-recommends         postgresql-16 postgresql-16-pgvector postgresql-16-mysql-fdw  && sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen  && apt-get purge -y --auto-remove curl gnupg  && rm -rf /var/lib/apt/lists/*  && rm -rf /var/lib/postgresql/16/main /etc/postgresql/16/main
+#
+# ⚠ **`mysql_fdw` 는 런타임에서 apt 로 깔지 않는다.** 2026-10-29 실측:
+#   그렇게 구웠더니 엔진 이미지가 **5C / 178H** 가 됐다. `postgresql-16-mysql-fdw`
+#   가 `default-libmysqlclient-dev` 를 **하드 의존**하고, 그 사슬이 커널 헤더
+#   (`linux-libc-dev`)를 끌고 오는데 그 하나가 그 숫자를 거의 다 들고 있었다.
+#   ⚠ 그렇다고 purge 하면 **fdw 자체가 같이 걷힌다**(하드 의존이라서) — `.so` 가
+#     사라지는 것을 봤다.
+#   그래서 확장 본체와 **같은 방식**으로 간다: 빌더에서 깔고 **파일만 복사**한다.
+#   `mysql_fdw.so` 는 **libc 에만 링크**되므로(ldd 확인) 런타임에는 공유 라이브러리
+#   `libmysqlclient21` 만 둔다.
+#   ⚠ 바꾼 뒤에는 **로드되는지 확인한다** —
+#     `SELECT * FROM pg_available_extensions WHERE name='mysql_fdw'`.
+RUN apt-get update && apt-get install -y --no-install-recommends         ca-certificates curl gnupg locales  && install -d /usr/share/postgresql-common/pgdg  && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc       -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main"       > /etc/apt/sources.list.d/pgdg.list  && apt-get update && apt-get install -y --no-install-recommends         postgresql-16 postgresql-16-pgvector libmysqlclient21  && sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen  && apt-get purge -y --auto-remove curl gnupg  && rm -rf /var/lib/apt/lists/*  && rm -rf /var/lib/postgresql/16/main /etc/postgresql/16/main
 
 COPY --from=builder /src/engine/target/release/ontological-pg16/usr/lib/postgresql/16/lib/                     /usr/lib/postgresql/16/lib/
+# MySQL 외부 데이터 래퍼 — **빌더에서 깔고 파일만 가져온다**(위 ⚠ 참고).
+COPY --from=builder /usr/lib/postgresql/16/lib/mysql_fdw.so \
+                    /usr/lib/postgresql/16/lib/
+COPY --from=builder /usr/share/postgresql/16/extension/mysql_fdw* \
+                    /usr/share/postgresql/16/extension/
+
+# ⚠ **버전 없는 이름을 만들어 준다.** `mysql_fdw` 는 `libmysqlclient.so` 를
+#   dlopen 하는데, 그 심볼릭 링크는 **-dev 꾸러미**가 만든다. 런타임 꾸러미는
+#   `libmysqlclient.so.21` 만 둔다 — 링크가 없으면 확장 설치가 이렇게 죽는다:
+#     libmysqlclient.so: cannot open shared object file
+#   (2026-10-29 실측. -dev 를 들이는 대신 링크 한 줄로 끝낸다.)
+RUN ln -s libmysqlclient.so.21 \
+          /usr/lib/x86_64-linux-gnu/libmysqlclient.so
+
 COPY --from=builder /src/engine/target/release/ontological-pg16/usr/share/postgresql/16/extension/                     /usr/share/postgresql/16/extension/
 
 COPY docker/runtime/10-ontological-init.sh /docker-entrypoint-initdb.d/10-ontological-init.sh
