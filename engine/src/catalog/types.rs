@@ -7,6 +7,7 @@
 
 use crate::catalog::labeling;
 use pgrx::prelude::*;
+use pgrx::PgTryBuilder;
 
 /// Property types we are willing to materialise as columns. Anything else is
 /// rejected at declaration time rather than failing later at write time.
@@ -86,19 +87,78 @@ pub fn try_type_name(tid: i32) -> Option<String> {
     .flatten()
 }
 
+/// Is this alias name already spoken for by a type in **another** graph?
+///
+/// The alias view lives in one schema (`og_data`) and its name is the bare label,
+/// so `Event` in graph A and `Event` in graph B want the same object. The catalog
+/// lock is per graph (`lock_graph_catalog`), which is exactly the wrong shape for
+/// a schema-global name: it serialises the writers who *cannot* collide and leaves
+/// the ones who *can* running side by side.
+///
+/// Measured 2026-10-15: twenty concurrent creations of the same label name across
+/// two graphs failed three times with `pg_type_typname_nsp_index`; done serially,
+/// the second graph silently took the first graph's view, so reading
+/// `og_data."Event"` in SQL showed **the wrong graph**.
+fn alias_taken_by_other_graph(tid: i32, name: &str) -> bool {
+    crate::spiu::one::<bool>(
+        "SELECT EXISTS (
+           SELECT 1 FROM og_catalog.type t
+            WHERE t.name = $2
+              AND t.graph_id <> (SELECT graph_id FROM og_catalog.type WHERE type_id = $1)
+         )",
+        &[tid.into(), name.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 pub fn ensure_alias_view(tid: i32, name: &str, table: &str) {
+    // **Do not take a name another graph is using.** Dropping and recreating would
+    // leave that graph's alias pointing here, and a person reading `og_data."Event"`
+    // would get rows from a project they did not ask about. The convenience is not
+    // worth that; the graph that got there first keeps the name.
+    if alias_taken_by_other_graph(tid, name) {
+        pgrx::log!(
+            "alias view for type {tid} ({name}) skipped: another graph already uses that name"
+        );
+        return;
+    }
+
     let view = alias_view_name(name);
     // A type name is user input; quoting is what makes that safe here.
-    let _ = Spi::run(&format!("DROP VIEW IF EXISTS {view}"));
-    if let Err(e) = Spi::run(&format!(
-        "CREATE VIEW {view}{} AS SELECT * FROM {table}",
-        crate::spiu::VIEW_SECURITY
-    )) {
-        // Never fatal: the view is a convenience, and a name that collides with
-        // something already in the schema must not stop a type from existing.
-        pgrx::log!("could not create the alias view for type {tid} ({name}): {e}");
-    } else {
-        crate::catalog::privileges::apply_to_view(&view);
+    //
+    // **The whole pair runs inside a subtransaction.** The old code caught the
+    // `Err` and logged it, calling itself "never fatal" — but a failed statement
+    // aborts the surrounding transaction in PostgreSQL, so catching the Rust-side
+    // error changed nothing: the caller died anyway with `duplicate key value
+    // violates unique constraint "pg_type_typname_nsp_index"`. That is how a
+    // convenience feature took down eleven writes in one ingestion run
+    // (2026-10-15). `PgTryBuilder` is what this repository uses for exactly this
+    // (docs/05_llm/03_correctable_errors.md).
+    //
+    // 상류는 이 자리를 하위 트랜잭션 없이 두고, 대신 `apply_to_view` 에
+    // `og_data.{name}`(따옴표 없는 꼴)을 넘겨 이중 따옴표 문제를 피했다.
+    // 우리는 그 문제를 **받는 쪽에서** 고쳤다 — `apply_to_*` 가 받은 이름을
+    // 다시 따옴표로 싸지 않는다(privileges.rs 의 그 긴 주석이 경위다).
+    // 그래서 여기서는 우리 꼴을 지킨다: 하위 트랜잭션은 **포기할 수 없다**.
+    let created = PgTryBuilder::new(|| {
+        let _ = Spi::run(&format!("DROP VIEW IF EXISTS {view}"));
+        Spi::run(&format!(
+            "CREATE VIEW {view}{} AS SELECT * FROM {table}",
+            crate::spiu::VIEW_SECURITY
+        ))
+        .is_ok()
+    })
+    .catch_others(|_| {
+        // Never fatal — and now that is true rather than intended.
+        pgrx::log!("could not create the alias view for type {tid} ({name})");
+        false
+    })
+    .execute();
+
+    if created {
+        crate::catalog::privileges::apply_to_view(tid, &view);
     }
 }
 
@@ -216,10 +276,31 @@ pub fn resolve_or_create_label_set(gid: i32, graph: &str, labels: &[String], kin
     if labels.is_empty() {
         error!("CREATE requires a label per new node");
     }
+    // Hold the graph's catalog lock across the whole look-then-create loop.
+    // Taking it only inside `create_type_inner` would still let two writers of
+    // the *same* new label both read "absent" here, and the loser would fail
+    // with "type already exists" — a spurious error for a write that is legal
+    // in Neo4j. The lock is re-entrant within a transaction, so the nested take
+    // inside `create_type_inner` costs nothing.
+    labeling::lock_graph_catalog(gid);
     let mut parents: Vec<String> = Vec::new();
     for name in labels {
-        if try_type_id(gid, name).is_none() {
-            create_type_inner(graph, name, kind, &parents, false);
+        match try_type_id(gid, name) {
+            None => {
+                create_type_inner(graph, name, kind, &parents, false);
+            }
+            // The type already exists. It may still be unplaced: `CREATE
+            // CONSTRAINT FOR (n:Doc) …` declares `Doc` before any node carries
+            // it, and a constraint says nothing about where `Doc` sits in the
+            // hierarchy. Left as a root, the first `(:_Entity:Doc)` write would
+            // then fail forever — the labels are not on one chain, and no
+            // amount of retrying changes that.
+            //
+            // So adopt it now, under the same left-to-right reading that
+            // governs a freshly created label. Only when it is safe: a root
+            // with no instances, which is exactly the "declared but never
+            // used" case a constraint leaves behind.
+            Some(tid) => adopt_if_unplaced(gid, tid, name, &parents),
         }
         parents.push(name.clone());
     }
@@ -233,6 +314,77 @@ pub fn resolve_or_create_label_set(gid: i32, graph: &str, labels: &[String], kin
         ),
         Err(e) => error!("{e}"),
     }
+}
+
+/// Place an already-declared type under `parents`, if that is safe.
+///
+/// "Safe" is narrow on purpose:
+///
+///   * it is already a subtype of every parent — nothing to do;
+///   * it has parents of its own — someone placed it deliberately, and moving
+///     it would silently rewrite a hierarchy the author chose;
+///   * it holds rows — a type's storage table is its own, but its inherited
+///     columns come from its parents, so adopting a populated type would mean
+///     backfilling. Refuse rather than half-do it.
+///
+/// What remains is the case this exists for: a root type with no instances,
+/// which is what `CREATE CONSTRAINT` leaves behind.
+fn adopt_if_unplaced(gid: i32, tid: i32, name: &str, parents: &[String]) {
+    if parents.is_empty() {
+        return;
+    }
+    let parent_ids: Vec<i32> = parents.iter().map(|p| type_id(gid, p)).collect();
+    if parent_ids.iter().all(|p| *p == tid || labeling::og_is_subtype(tid, *p)) {
+        return;
+    }
+    let has_parent = crate::spiu::one::<bool>(
+        "SELECT true FROM og_catalog.type_parent WHERE type_id = $1 LIMIT 1",
+        &[tid.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if has_parent {
+        return;
+    }
+
+    let kind = type_kind(tid);
+    let table = match kind {
+        'e' => node_table(tid),
+        'r' => edge_table(tid),
+        // Attribute types have no storage and no instances to weigh.
+        _ => return,
+    };
+    let occupied = crate::spiu::one::<bool>(
+        &format!("SELECT true FROM {table} LIMIT 1"),
+        &[],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if occupied {
+        return;
+    }
+
+    for pid in parent_ids {
+        if type_kind(pid) != kind {
+            return;
+        }
+        Spi::run_with_args(
+            "INSERT INTO og_catalog.type_parent (type_id, parent_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+            &[tid.into(), pid.into()],
+        )
+        .expect("parent insert failed");
+        copy_inherited_properties(pid, tid, &table);
+    }
+    // Subtype tests read the nested-set intervals in `og_catalog.type_label`,
+    // not `type_parent` directly. Without this the edge exists and
+    // `og_is_subtype` still says no — the adoption would look like it did
+    // nothing at all.
+    labeling::relabel_graph(gid);
+    labeling::bump_schema_version(gid, &format!("adopt {name} under {}", parents.join(":")));
+    log!("type '{name}' adopted under ({}) on first labelled write", parents.join(":"));
 }
 
 /// Nearest type names by edit distance — feeds spec 008 FR-008 (correctable
@@ -373,6 +525,14 @@ pub fn create_type_inner(
     is_abstract: bool,
 ) -> i32 {
     let gid = graph_id(graph);
+    // Serialise catalog mutation for this graph before looking: the existence
+    // check and the insert have to be one step. Two writers creating the first
+    // node of the same label otherwise both see "absent" and both insert, and
+    // two writers creating *different* labels both relabel the whole graph and
+    // collide on `type_label_pkey`. Cypher creates labels on first write, so
+    // any parallel ingestion hits this — the legacy analyzer did, halfway
+    // through loading an AST.
+    labeling::lock_graph_catalog(gid);
     if try_type_id(gid, name).is_some() {
         error!("type '{name}' already exists in graph '{graph}'");
     }
@@ -424,7 +584,7 @@ pub fn create_type_inner(
             )
         };
         Spi::run(&base).expect("type table creation failed");
-        crate::catalog::privileges::apply_to_table(&table);
+        crate::catalog::privileges::apply_to_table(tid, &table);
         // A view named after the type. The physical table is `n_<type_id>`
         // because a type can be renamed in constant time and its identifier
         // must not move; the cost is that `\dt` shows `n_45` and nothing about
@@ -455,10 +615,46 @@ pub fn create_type_inner(
     .expect("id alloc init failed");
 
     labeling::relabel_graph(gid);
+
+    // Settings declared on an ancestor reach a subtype created later: the
+    // labels above are what make the ancestry visible, so this comes after.
+    if !is_abstract && k != 'a' {
+        if crate::security::inherits_stamping(tid) {
+            if let Some(table) = storage_table(tid) {
+                crate::security::stamp_table(&table);
+            }
+        }
+        if crate::temporal::is_temporal(tid) {
+            crate::temporal::enable_table(tid);
+        }
+        inherit_history_capture(graph, tid);
+        crate::security::replay_write_grants(tid);
+    }
     tid
 }
 
-fn copy_inherited_properties(parent: i32, child: i32, child_table: &str) {
+/// `og_enable_history` on an ancestor covers a subtype created afterwards.
+fn inherit_history_capture(graph: &str, tid: i32) {
+    let on = crate::spiu::one::<bool>(
+        "SELECT true FROM og_catalog.setting s
+           JOIN og_catalog.type t ON s.key = 'history.' || $1 || '.' || t.name
+          WHERE t.type_id = ANY($2) AND s.value = 'on' LIMIT 1",
+        &[graph.into(), labeling::og_supertypes(tid).into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if let (true, Some(table)) = (on, storage_table(tid)) {
+        Spi::run(&format!(
+            "CREATE OR REPLACE TRIGGER og_hist_{tid}
+               AFTER INSERT OR UPDATE OR DELETE ON {table}
+               FOR EACH ROW EXECUTE FUNCTION og_capture_history()"
+        ))
+        .unwrap_or_else(|e| error!("failed to enable history on {table}: {e}"));
+    }
+}
+
+pub fn copy_inherited_properties(parent: i32, child: i32, child_table: &str) {
     let props: Vec<(String, String, String, bool, bool)> = Spi::connect(|client| {
         client
             .select(
@@ -528,8 +724,11 @@ fn og_add_property(
     let col = column_name(prop);
 
     if required {
+        // Relation instances live in og_edge, not og_node; counting only nodes
+        // let a required property onto a relation type with edges in it.
         let n = crate::spiu::one::<i64>(
-            "SELECT count(*) FROM og_data.og_node WHERE type_id = ANY($1)",
+            "SELECT (SELECT count(*) FROM og_data.og_node WHERE type_id = ANY($1))
+                  + (SELECT count(*) FROM og_data.og_edge WHERE type_id = ANY($1))",
             &[labeling::og_subtypes(tid).into()],
         )
         .expect("count failed")
@@ -581,6 +780,7 @@ fn og_add_property(
                 ))
                 .expect("unique index failed");
             }
+            crate::temporal::sync_history(sub);
             if sub != tid {
                 Spi::run_with_args(
                     "INSERT INTO og_catalog.property
@@ -601,6 +801,8 @@ fn og_add_property(
         if let (Some(table), Some(sub_name)) = (storage_table(sub), try_type_name(sub)) {
             ensure_alias_view(sub, &sub_name, &table);
         }
+        // A grant on "every property" of a type covers this column too.
+        crate::security::replay_write_grants(sub);
     }
     labeling::bump_schema_version(gid, &format!("add property {type_name}.{prop}"));
 }
@@ -617,6 +819,7 @@ fn og_create_index(graph: &str, type_name: &str, prop: &str) {
                 .expect("index creation failed");
         }
     }
+    labeling::bump_schema_version(gid, &format!("create index {type_name}.{prop}"));
 }
 
 pub fn storage_table(tid: i32) -> Option<String> {

@@ -108,7 +108,7 @@ fn og_map_table(
         crate::spiu::qname(source_table)
     ))
     .unwrap_or_else(|e| error!("failed to create mapping view: {e}"));
-    crate::catalog::privileges::apply_to_view(&table);
+    crate::catalog::privileges::apply_to_view(tid, &table);
 
     Spi::run_with_args(
         "INSERT INTO og_catalog.mapping (type_id, source_table, id_column, property_map, writable)
@@ -120,7 +120,9 @@ fn og_map_table(
     )
     .expect("mapping registration failed");
 
-    crate::cypher::views::drop_all_views();
+    // A bump, not just a view drop: the Cypher plan cache is keyed on the
+    // schema version, and a cached plan still names the old storage.
+    crate::catalog::labeling::bump_schema_version(gid, &format!("map table onto {type_name}"));
 }
 
 /// Materialise a mapped type into native storage — spec 005 FR-010.
@@ -172,7 +174,10 @@ fn og_materialize_mapping(graph: &str, type_name: &str) -> i64 {
         &[tid.into()],
     )
     .ok();
-    crate::cypher::views::drop_all_views();
+    crate::catalog::labeling::bump_schema_version(
+        crate::catalog::types::graph_id(graph),
+        &format!("materialize mapping {type_name}"),
+    );
     n
 }
 

@@ -142,7 +142,92 @@ BEGIN
 END
 $$;
 
+\echo '--- a list-valued property can be indexed ---'
+-- An undeclared property is read with `->>`, which is text, and jsonb has no
+-- operator against text: `hr.tags[0]` reached PostgreSQL as `text -> integer`
+-- and the whole query died. The relationship here has no view alias either,
+-- so it also covers the `og_edge_json` reading of the same defect.
+DO $$
+DECLARE got jsonb;
+BEGIN
+    PERFORM og_cypher('reg',
+        'MATCH (a:P {name:"a"}), (b:P {name:"b"})
+         CREATE (a)-[:L {tags:["x","y"]}]->(b)');
+
+    SELECT og_cypher INTO got FROM og_cypher('reg',
+        'MATCH ()-[r:L]->() RETURN r.tags[0] AS t, head(r.tags) AS h, size(r.tags) AS n');
+    IF got IS NULL OR got->>'t' <> 'x' OR got->>'h' <> 'x' OR (got->>'n')::int <> 2 THEN
+        RAISE EXCEPTION 'indexing a list property gave %', got;
+    END IF;
+END
+$$;
+
+\echo '--- coalesce over a list element keeps it a value, not its JSON text ---'
+-- `head`/`last`/`element_at` yield jsonb, but is_jsonb_valued did not say so,
+-- so coalesce took the text route and cast the jsonb with `::text`. The caller
+-- got the JSON *representation* — `"x"`, quotes included — instead of `x`.
+DO $$
+DECLARE got jsonb;
+BEGIN
+    SELECT og_cypher INTO got FROM og_cypher('reg',
+        'RETURN coalesce(["x","y"][0], "") AS a,
+                coalesce([][0], "fallback")  AS b,
+                coalesce([10,20][1], 0)      AS c');
+    IF got->>'a' <> 'x' THEN
+        RAISE EXCEPTION 'coalesce(list[0], "") gave %, want x', got->>'a';
+    END IF;
+    -- An empty list indexes to NULL, so the second branch has to be reached.
+    IF got->>'b' <> 'fallback' THEN
+        RAISE EXCEPTION 'coalesce([][0], "fallback") gave %', got->>'b';
+    END IF;
+    IF (got->>'c')::int <> 20 THEN
+        RAISE EXCEPTION 'coalesce([10,20][1], 0) gave %', got->>'c';
+    END IF;
+END
+$$;
+
+\echo '--- a schema change invalidates only its own graph views ---'
+-- Generated views were dropped globally on every schema change, so a write in
+-- one graph broke concurrent reads in another: the reader had already compiled
+-- `og_data.v_<tid>` into its SQL and got `relation … does not exist`. Views are
+-- rebuilt lazily, so the next attempt worked — a one-shot error pointing
+-- nowhere near its cause. An inheritance chain never leaves its graph, so the
+-- invalidation is scoped to the graph that changed.
+DO $$
+DECLARE tid int; other_graph int; v text;
+BEGIN
+    PERFORM og_create_graph('reg_other');
+    PERFORM og_cypher('reg_other', 'CREATE (:Other {name:"x"})');
+
+    -- Reading a property is what builds the view.
+    PERFORM og_cypher('reg', 'MATCH (p:P) RETURN p.name AS n');
+    SELECT t.type_id INTO tid
+      FROM og_catalog.type t JOIN og_catalog.graph g USING (graph_id)
+     WHERE g.name = 'reg' AND t.name = 'P';
+    v := 'og_data.v_' || tid;
+    IF to_regclass(v) IS NULL THEN
+        RAISE EXCEPTION 'setup: reading a property did not build %', v;
+    END IF;
+
+    -- A new label in ANOTHER graph must leave it alone.
+    PERFORM og_cypher('reg_other', 'CREATE (:BrandNewOverThere {name:"y"})');
+    IF to_regclass(v) IS NULL THEN
+        RAISE EXCEPTION '% was dropped by a schema change in another graph', v;
+    END IF;
+
+    -- A new label in the SAME graph must still invalidate it.
+    PERFORM og_cypher('reg', 'CREATE (:BrandNewHere {name:"z"})');
+    IF to_regclass(v) IS NOT NULL THEN
+        RAISE EXCEPTION '% survived a schema change in its own graph', v;
+    END IF;
+
+    PERFORM og_drop_graph('reg_other');
+END
+$$;
+
 \echo '--- and what cannot be honoured is refused, not ignored ---'
+\echo 'OG_TEST_END'
+
 -- EXPECT_ERROR: an aggregate in a WITH before a write reshapes the bindings,
 -- so it is refused rather than dropped.
 SELECT og_cypher('reg', 'MATCH (p:P) WITH count(p) AS c DELETE p');

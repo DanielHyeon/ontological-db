@@ -18,6 +18,31 @@
 use pgrx::prelude::*;
 use std::collections::{HashMap, HashSet};
 
+/// Namespace for the per-graph advisory lock that serialises catalog mutation.
+///
+/// Relabelling is `DELETE` every label of a graph, then re-`INSERT` them. Two
+/// transactions doing that at once both delete a set neither can see the other
+/// re-creating, then collide on `type_label_pkey`. Nothing about the statements
+/// is wrong; they simply must not interleave. A transaction-scoped advisory
+/// lock keyed on the graph serialises them and is released at commit, so no
+/// caller has to remember to unlock.
+///
+/// Chosen arbitrarily but fixed: advisory-lock keys are a flat global space, so
+/// the value only has to be one nobody else in this database uses.
+pub const CATALOG_LOCK_NS: i32 = 0x6F67_0001u32 as i32;
+
+/// Take the per-graph catalog lock for the rest of this transaction.
+///
+/// Re-entrant — Postgres counts advisory locks per transaction, so a caller
+/// that already holds it (type creation, which then relabels) may take it again.
+pub fn lock_graph_catalog(graph_id: i32) {
+    Spi::run_with_args(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        &[CATALOG_LOCK_NS.into(), graph_id.into()],
+    )
+    .expect("failed to take the graph catalog lock");
+}
+
 /// Spacing between successive labels. Inserting a type between a parent and its
 /// child costs nothing until 1024 insertions have happened at the same spot.
 pub const GAP: i64 = 1024;
@@ -115,6 +140,10 @@ fn assign(
 /// is the fallback path — [`insert_between`] handles the common case without
 /// touching existing labels.
 pub fn relabel_graph(graph_id: i32) {
+    // Before reading the DAG: the read has to be inside the same critical
+    // section as the write, or two callers relabel from the same stale picture.
+    lock_graph_catalog(graph_id);
+
     let dag = load_dag(graph_id);
     if dag.is_empty() {
         return;
@@ -171,11 +200,14 @@ pub fn relabel_graph(graph_id: i32) {
 
 pub fn bump_schema_version(graph_id: i32, description: &str) {
     // Generated per-type union views encode the descendant set, so any schema
-    // change invalidates them (spec 003 / cypher::views).
-    crate::cypher::views::drop_all_views();
+    // change invalidates them (spec 003 / cypher::views) — but only this
+    // graph's, since an inheritance chain never leaves its graph.
+    crate::cypher::views::drop_views_for_graph(graph_id);
+    // The whole catalog of the graph as it stands after this change, so "what
+    // structure was this written under?" has an answer (spec 012 FR-009).
     Spi::run_with_args(
-        "INSERT INTO og_catalog.schema_version (version, graph_id, description)
-         VALUES (nextval('og_catalog.schema_version_seq'), $1, $2)",
+        "INSERT INTO og_catalog.schema_version (version, graph_id, description, snapshot)
+         VALUES (nextval('og_catalog.schema_version_seq'), $1, $2, og__schema_snapshot($1))",
         &[graph_id.into(), description.into()],
     )
     .expect("failed to bump schema version");

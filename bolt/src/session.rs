@@ -59,6 +59,50 @@ struct Session<'a> {
     /// `type`. Drivers expose it as `ResultSummary.query_type`, and tools built
     /// on the driver read it to decide whether a statement is allowed to run.
     qtype: &'static str,
+    /// Settings from the open transaction's `tx_metadata` (spec 014 FR-010,
+    /// spec 013 FR-009), re-applied with every RUN inside it.
+    tx_meta: Vec<(String, String)>,
+}
+
+/// The `tx_metadata` keys the gateway understands, and the setting each one
+/// becomes. Neo4j drivers already carry application metadata this way, so a
+/// client names who it is acting for — or the instant it wants to read at —
+/// without a new API. Unknown keys are ignored.
+const TX_SETTINGS: &[(&str, &str)] = &[
+    ("actor", "og.actor"),
+    ("source", "og.source"),
+    ("reason", "og.reason"),
+    ("request_id", "og.request_id"),
+    ("requestId", "og.request_id"),
+    ("valid_at", "og.valid_at"),
+    ("validAt", "og.valid_at"),
+    ("system_at", "og.system_at"),
+    ("systemAt", "og.system_at"),
+    ("valid_from", "og.valid_from"),
+    ("validFrom", "og.valid_from"),
+    ("valid_to", "og.valid_to"),
+    ("validTo", "og.valid_to"),
+];
+
+/// `extra.tx_metadata` → (setting, value) pairs.
+fn tx_settings(extra: &Value) -> Vec<(String, String)> {
+    let Some(Value::Map(meta)) = extra.map_get("tx_metadata") else { return Vec::new() };
+    let mut out = Vec::new();
+    for (key, setting) in TX_SETTINGS {
+        let Some(v) = meta.get(*key) else { continue };
+        let text = match v {
+            Value::String(s) => s.clone(),
+            Value::Null => continue,
+            other => match to_json(other) {
+                serde_json::Value::String(s) => s,
+                j => j.to_string(),
+            },
+        };
+        if !out.iter().any(|(s, _): &(String, String)| s == setting) {
+            out.push((setting.to_string(), text));
+        }
+    }
+    out
 }
 
 pub fn serve(mut stream: TcpStream, config: &Config) -> io::Result<()> {
@@ -76,6 +120,7 @@ pub fn serve(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         fields: Vec::new(),
         cursor: 0,
         qtype: "r",
+        tx_meta: Vec::new(),
     };
     sess.run(&mut stream)
 }
@@ -209,12 +254,26 @@ impl Session<'_> {
         self.select_graph(&extra);
         self.sql("BEGIN")?;
         self.in_tx = true;
+        self.tx_meta = tx_settings(&extra);
+        let meta = self.tx_meta.clone();
+        self.apply_settings(&meta)?;
         Ok(Value::Map(BTreeMap::new()))
+    }
+
+    /// Transaction-local, so nothing outlives the transaction it was sent with.
+    fn apply_settings(&mut self, settings: &[(String, String)]) -> Result<(), Failure> {
+        for (k, v) in settings {
+            let pg = self.client()?;
+            pg.execute("SELECT set_config($1, $2, true)", &[k, v])
+                .map_err(|e| Failure::from_pg(&e))?;
+        }
+        Ok(())
     }
 
     fn end_tx(&mut self, verb: &str) -> Result<Value, Failure> {
         self.sql(verb)?;
         self.in_tx = false;
+        self.tx_meta.clear();
         Ok(map(vec![("bookmark", string("ontological:0"))]))
     }
 
@@ -288,6 +347,17 @@ impl Session<'_> {
             row.get(0)
         };
 
+        // An auto-commit RUN may carry its own tx_metadata. Settings are
+        // transaction-local, so the query gets a transaction to hold them.
+        let own = if self.in_tx { Vec::new() } else { tx_settings(&extra) };
+        let wrap = !own.is_empty();
+        if wrap {
+            self.sql("BEGIN")?;
+            if let Err(f) = self.apply_settings(&own) {
+                let _ = self.sql("ROLLBACK");
+                return Err(f);
+            }
+        }
         let rows = {
             let graph = self.graph.clone();
             let pg = self.client()?;
@@ -295,7 +365,19 @@ impl Session<'_> {
                 "SELECT og_cypher($1::text, $2::text, $3::text::jsonb)::text",
                 &[&graph, &query, &params_json],
             )
-            .map_err(|e| Failure::from_pg(&e))?
+            .map_err(|e| Failure::from_pg(&e))
+        };
+        let rows = match (rows, wrap) {
+            (Ok(r), true) => {
+                self.sql("COMMIT")?;
+                r
+            }
+            (Ok(r), false) => r,
+            (Err(f), true) => {
+                let _ = self.sql("ROLLBACK");
+                return Err(f);
+            }
+            (Err(f), false) => return Err(f),
         };
 
         let mut records = Vec::with_capacity(rows.len());
@@ -475,7 +557,14 @@ fn split_plan_prefix(query: &str) -> (&str, bool) {
             && trimmed[..kw.len()].eq_ignore_ascii_case(kw)
             && trimmed.as_bytes()[kw.len()].is_ascii_whitespace()
         {
-            return (trimmed[kw.len()..].trim_start(), true);
+            let rest = trimmed[kw.len()..].trim_start();
+            // `EXPLAIN FABRIC <query>` is a statement of its own — it runs the
+            // query and reports what each source was sent — not a request for
+            // a plan with no records.
+            if rest.len() > 6 && rest[..6].eq_ignore_ascii_case("fabric") && rest.as_bytes()[6].is_ascii_whitespace() {
+                return (query, false);
+            }
+            return (rest, true);
         }
     }
     (query, false)
@@ -577,6 +666,35 @@ impl Failure {
     /// (principle VIII). It is passed through verbatim; only the code is ours.
     fn from_pg(e: &postgres::Error) -> Self {
         let message = pg_message(e);
+
+        // **교착·직렬화 실패는 "질의가 틀렸다" 가 아니다 — 다시 하면 되는 것이다.**
+        //
+        // 여기에 분기가 없어서 둘 다 아래 `else` 로 떨어져
+        // `Neo.ClientError.Statement.ArgumentError` 가 됐다. 드라이버는 그것을
+        // "클라이언트 잘못" 으로 올리므로 **재시도하지 말라는 뜻**이 되고, 앱의
+        // `with_retry`(ingestion/event_storming/neo4j_ops/_bulk_helper.py)는
+        // 문구에서 `DeadlockDetected` 를 찾는데 PostgreSQL 은 `deadlock detected`
+        // 라고 쓴다 — **재시도 장치가 있는데 한 번도 안 걸렸다**(2026-10-16 재현).
+        //
+        // 표준 코드로 보내면 드라이버가 `TransientError` 를 올리고 문구에
+        // `DeadlockDetected` 가 들어가 **이미 있는 재시도가 그대로 걸린다.**
+        // 메시지는 건드리지 않는다 — PostgreSQL 의 설명이 가장 쓸모 있다.
+        if let Some(db) = e.as_db_error() {
+            let sqlstate = db.code().code();
+            if sqlstate == "40P01" {
+                return Failure::client(
+                    "Neo.TransientError.Transaction.DeadlockDetected",
+                    message,
+                );
+            }
+            if sqlstate == "40001" {
+                return Failure::client(
+                    "Neo.TransientError.Transaction.Terminated",
+                    message,
+                );
+            }
+        }
+
         let code = if message.contains("not supported")
             || message.contains("expected")
             || message.contains("unknown label")
@@ -603,4 +721,33 @@ impl Failure {
 
 fn pg_message(e: &postgres::Error) -> String {
     e.as_db_error().map(|d| d.message().to_string()).unwrap_or_else(|| e.to_string())
+}
+
+#[cfg(test)]
+mod tx_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn known_keys_become_settings() {
+        let extra = map(vec![(
+            "tx_metadata",
+            map(vec![
+                ("actor", string("agent-7")),
+                ("validAt", string("2021-06-01")),
+                ("request_id", Value::Int(42)),
+                ("unrelated", string("ignored")),
+            ]),
+        )]);
+        let got = tx_settings(&extra);
+        assert!(got.contains(&("og.actor".into(), "agent-7".into())));
+        assert!(got.contains(&("og.valid_at".into(), "2021-06-01".into())));
+        assert!(got.contains(&("og.request_id".into(), "42".into())));
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn no_metadata_no_settings() {
+        assert!(tx_settings(&Value::Null).is_empty());
+        assert!(tx_settings(&map(vec![("db", string("g"))])).is_empty());
+    }
 }

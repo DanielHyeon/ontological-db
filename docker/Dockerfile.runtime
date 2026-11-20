@@ -1,0 +1,178 @@
+# Ontological — 배포용 런타임 이미지 (개발용 `Dockerfile.dev` 와 별개)
+#
+# `Dockerfile.dev` 는 **작업 환경**이다. Rust 툴체인과 cargo-pgrx 가 들어 있고,
+# 소스를 `/work` 에 마운트해 컨테이너 안에서 빌드한다. 엔트리포인트는
+# `sleep infinity` 이고 Postgres 와 Bolt 는 `start.sh` 가 손으로 띄운다.
+# **설치본에 그대로 못 쓴다** — 소스가 없고, 툴체인만 수 GB 이고, 스스로 뜨지 않는다.
+#
+# 이 파일은 그 반대다. 빌드는 builder 단계에서 끝내고, 런타임에는 **산출물 둘만**
+# 옮긴다.
+#
+#     ontological.so + .control + .sql   Postgres 확장
+#     ontological-bolt                   Bolt 프로토콜 게이트웨이 (단일 바이너리)
+#
+# ## 왜 이미지를 둘로 나누나
+#
+# Bolt 게이트웨이는 **상태를 갖지 않는다** — 받은 질의를 전부 `og_cypher()` 로 넘길
+# 뿐이다(`docs` §4). 그래서 Postgres 와 한 컨테이너에 묶을 이유가 없고, 묶으면 손해다.
+#
+#   - 공식 postgres 이미지의 엔트리포인트를 그대로 쓸 수 있다 — initdb·PGDATA·
+#     `docker-entrypoint-initdb.d` 훅·시그널 처리를 우리가 다시 만들지 않는다.
+#   - **Bolt 의 수명을 compose 가 쥔다.** 이 저장소가 실제로 밟은 함정이 여기다:
+#     엔진을 다시 깔고 Bolt 를 안 띄워서 **psql 은 되는데 앱만 죽는** 상태가 반복됐다.
+#     `start.sh` 의 `pgrep` 이 자기 명령줄에 매치돼 "이미 떠 있다"로 판정하던 것도
+#     같은 뿌리다. 별도 서비스로 두면 그 부류가 구조적으로 안 생긴다.
+#   - 게이트웨이만 따로 재기동할 수 있다.
+#
+# ## 타깃
+#
+#     docker build --target runtime-db   -t ontological-db:<태그>   -f docker/Dockerfile.runtime .
+#     docker build --target runtime-bolt -t ontological-bolt:<태그> -f docker/Dockerfile.runtime .
+
+# =============================================================================
+# builder — 여기서만 Rust 를 쓴다. 산출물 외에는 아무것도 다음 단계로 안 넘어간다.
+# =============================================================================
+# ⚠ **베이스를 Debian trixie 에서 Ubuntu 24.04(noble) 로 옮겼다** (2026-10-22).
+#
+# trixie 의 `zlib` 에 CVE-2026-85091 이 걸려 있는데 **데비안이 고친 판을 안 냈다**
+# (보안 추적기 확인 — trixie·sid 모두 vulnerable, 버그 #1146895). "우리가 할 수
+# 있는 일이 없다" 고 접어 둔 자리였는데, 베이스를 나란히 재 보니 갈렸다:
+#
+#     debian:trixie-slim   **0C 1H**   ← 그 zlib
+#     ubuntu:24.04         **0C 0H**
+#
+# 같은 glibc 계열이라 바이너리·확장 ABI 를 그대로 쓸 수 있고, PGDG 도
+# `noble-pgdg` 로 같은 PostgreSQL 16 을 준다.
+#
+# ⚠ **builder 도 같이 옮긴다.** 확장 `.so` 는 빌드한 쪽 glibc 에 묶인다 —
+#   trixie(새 glibc)에서 지어 noble(옛 glibc)에서 돌리면 심볼이 안 맞는다.
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# PGDG 저장소 — 공식 postgres 이미지와 **같은 출처의 PostgreSQL 16** 을 쓴다.
+# 확장은 서버 ABI 에 묶이므로, 빌드한 쪽과 실행하는 쪽의 major 와 빌드가 맞아야 한다.
+#
+# ⚠ **major 는 16 에서 안 올린다.** 16 → 17 은 베이스 교체가 아니라 **데이터
+# 마이그레이션**이다 — 이미 깔린 PC 의 PGDATA 볼륨을 17 서버가 못 읽는다.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg lsb-release \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+         > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-16 postgresql-server-dev-16 \
+        build-essential pkg-config git \
+        postgresql-16-mysql-fdw \
+        libssl-dev libclang-dev clang libreadline-dev zlib1g-dev flex bison \
+    && rm -rf /var/lib/apt/lists/*
+
+# pgrx 는 root 로 Postgres 를 띄우기를 거부한다. 빌드만 할 것이라 `package` 로 충분하지만
+# init 이 서버를 만지므로 비root 사용자를 둔다.
+RUN useradd -m -s /bin/bash build
+USER build
+ENV RUSTUP_HOME=/home/build/.rustup CARGO_HOME=/home/build/.cargo
+ENV PATH=/home/build/.cargo/bin:/usr/lib/postgresql/16/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+# 버전을 고정한다 — engine/Cargo.toml 이 pgrx 를 `=0.19.2` 로 못 박고 있어서,
+# cargo-pgrx 가 그보다 앞서면 빌드가 갈린다.
+RUN cargo install cargo-pgrx --version 0.19.2 --locked
+RUN cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
+
+WORKDIR /src
+COPY --chown=build:build engine ./engine
+COPY --chown=build:build bolt ./bolt
+
+# `package` 는 설치 트리를 그대로 만들어 준다:
+#   target/release/ontological-pg16/usr/lib/postgresql/16/lib/ontological.so
+#   target/release/ontological-pg16/usr/share/postgresql/16/extension/*.{control,sql}
+RUN cd engine && cargo pgrx package --pg-config /usr/lib/postgresql/16/bin/pg_config
+RUN cd bolt && cargo build --release
+
+# =============================================================================
+# runtime-db — Postgres + ontological + pgvector
+# =============================================================================
+FROM ubuntu:24.04 AS runtime-db
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PGDATA=/var/lib/postgresql/data
+ENV LANG=en_US.utf8
+ENV PATH=/usr/lib/postgresql/16/bin:$PATH
+
+# ⚠ **uid/gid 를 999 로 먼저 못 박는다** (2026-10-21).
+#
+# 공식 `postgres` 이미지가 쓰는 번호다. 기존 볼륨의 파일 주인이 999 이므로,
+# 다른 번호로 만들면 **이미 있는 데이터를 못 읽는다**. apt 가 postgresql 을
+# 깔면서 postgres 계정을 만드는데, **먼저 만들어 두면 그것을 쓴다.**
+RUN groupadd --system --gid 999 postgres  && useradd --system --gid postgres --uid 999       --home-dir /var/lib/postgresql --shell /bin/bash postgres  && mkdir -p /var/lib/postgresql /var/run/postgresql  && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql
+
+# PGDG 의 postgresql-16 — builder 와 **같은 출처·같은 배포판**이라 확장 ABI 가 맞는다.
+#
+# ⚠ **`mysql_fdw` 는 런타임에서 apt 로 깔지 않는다.** 2026-10-29 실측:
+#   그렇게 구웠더니 엔진 이미지가 **5C / 178H** 가 됐다. `postgresql-16-mysql-fdw`
+#   가 `default-libmysqlclient-dev` 를 **하드 의존**하고, 그 사슬이 커널 헤더
+#   (`linux-libc-dev`)를 끌고 오는데 그 하나가 그 숫자를 거의 다 들고 있었다.
+#   ⚠ 그렇다고 purge 하면 **fdw 자체가 같이 걷힌다**(하드 의존이라서) — `.so` 가
+#     사라지는 것을 봤다.
+#   그래서 확장 본체와 **같은 방식**으로 간다: 빌더에서 깔고 **파일만 복사**한다.
+#   `mysql_fdw.so` 는 **libc 에만 링크**되므로(ldd 확인) 런타임에는 공유 라이브러리
+#   `libmysqlclient21` 만 둔다.
+#   ⚠ 바꾼 뒤에는 **로드되는지 확인한다** —
+#     `SELECT * FROM pg_available_extensions WHERE name='mysql_fdw'`.
+RUN apt-get update && apt-get install -y --no-install-recommends         ca-certificates curl gnupg locales  && install -d /usr/share/postgresql-common/pgdg  && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc       -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main"       > /etc/apt/sources.list.d/pgdg.list  && apt-get update && apt-get install -y --no-install-recommends         postgresql-16 postgresql-16-pgvector libmysqlclient21  && sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen  && apt-get purge -y --auto-remove curl gnupg  && rm -rf /var/lib/apt/lists/*  && rm -rf /var/lib/postgresql/16/main /etc/postgresql/16/main
+
+COPY --from=builder /src/engine/target/release/ontological-pg16/usr/lib/postgresql/16/lib/                     /usr/lib/postgresql/16/lib/
+# MySQL 외부 데이터 래퍼 — **빌더에서 깔고 파일만 가져온다**(위 ⚠ 참고).
+COPY --from=builder /usr/lib/postgresql/16/lib/mysql_fdw.so \
+                    /usr/lib/postgresql/16/lib/
+COPY --from=builder /usr/share/postgresql/16/extension/mysql_fdw* \
+                    /usr/share/postgresql/16/extension/
+
+# ⚠ **버전 없는 이름을 만들어 준다.** `mysql_fdw` 는 `libmysqlclient.so` 를
+#   dlopen 하는데, 그 심볼릭 링크는 **-dev 꾸러미**가 만든다. 런타임 꾸러미는
+#   `libmysqlclient.so.21` 만 둔다 — 링크가 없으면 확장 설치가 이렇게 죽는다:
+#     libmysqlclient.so: cannot open shared object file
+#   (2026-10-29 실측. -dev 를 들이는 대신 링크 한 줄로 끝낸다.)
+RUN ln -s libmysqlclient.so.21 \
+          /usr/lib/x86_64-linux-gnu/libmysqlclient.so
+
+COPY --from=builder /src/engine/target/release/ontological-pg16/usr/share/postgresql/16/extension/                     /usr/share/postgresql/16/extension/
+
+COPY docker/runtime/10-ontological-init.sh /docker-entrypoint-initdb.d/10-ontological-init.sh
+COPY docker/runtime/docker-entrypoint.sh   /usr/local/bin/docker-entrypoint.sh
+RUN for f in /docker-entrypoint-initdb.d/10-ontological-init.sh              /usr/local/bin/docker-entrypoint.sh; do         sed -i 's/$//' "$f"      && head -1 "$f" | grep -q '^#!/usr/bin/env bash$'      && ! grep -q "$(printf '')" "$f"      && chmod 0755 "$f";     done  && mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA"
+
+# 권한을 내릴 도구(gosu)가 필요 없도록 **처음부터 postgres 로 띄운다.**
+USER postgres
+EXPOSE 5432
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# =============================================================================
+# runtime-bolt — 게이트웨이 단일 바이너리
+# =============================================================================
+FROM ubuntu:24.04 AS runtime-bolt
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ⚠ **noble 에서는 `libssl3` 이다** (2026-10-22 베이스 이동).
+# trixie 는 64비트 time_t 전환으로 `libssl3t64` 였는데 noble 은 그 전이라
+# 옛 이름을 쓴다. 이름이 틀리면 빌드가 여기서 죽는다 — 죽는 것이 맞다.
+# 조용히 안 깔리면 Bolt 가 런타임에 라이브러리를 못 찾는다.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -s /usr/sbin/nologin bolt
+
+COPY --from=builder /src/bolt/target/release/ontological-bolt /usr/local/bin/ontological-bolt
+
+USER bolt
+# 게이트웨이는 컨테이너 안에서 모든 인터페이스에 연다. **밖으로 나가는지는 compose 의
+# 포트 매핑이 정한다** — 설치본은 루프백에만 매핑한다(Bolt 는 평문 인증이다).
+ENV OG_BOLT_LISTEN=0.0.0.0:7687
+EXPOSE 7687
+ENTRYPOINT ["/usr/local/bin/ontological-bolt"]
